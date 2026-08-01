@@ -490,7 +490,7 @@ def eval(generated, ground_truth, input_file, spider_path, startswith=False, deb
             print("-----startswith-----")
         return generated.startswith(ground_truth[2]["content"])
 
-    if input_file.startswith("gsm8k"):
+    if os.path.basename(input_file).startswith("gsm8k"):
         gt_match = re.search(gsm8k_pattern, ground_truth[2]["content"])
         gt_answer = None if not gt_match else gt_match.group(1)
         gen_match = re.search(gsm8k_pattern, generated)
@@ -502,10 +502,10 @@ def eval(generated, ground_truth, input_file, spider_path, startswith=False, deb
             print("-----GSM8K-----")
         return gt_answer == gen_answer
 
-    if input_file.startswith("spider"):
+    if os.path.basename(input_file).startswith("spider"):
         return spider_eval(generated, ground_truth, spider_path, debug=debug)
-    
-    if input_file.startswith("nq_open"):
+
+    if os.path.basename(input_file).startswith("nq_open"):
         answer_list = generated.split("; ")
         for answer in answer_list:
             if answer in ground_truth[2]["content"]:
@@ -669,14 +669,14 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
     print(len(sim_list))
     if sim_list:
         print(sum(sim_list) / len(sim_list), np.std(sim_list))
-    quantiles = np.quantile(sim_list, [0.1, 0.2, 0.5, 0.8, 0.9])
-    print(quantiles)
+        quantiles = np.quantile(sim_list, [0.1, 0.2, 0.5, 0.8, 0.9])
+        print(quantiles)
     if split_tune_untune:
         print(len(sim_list_untune))
         if sim_list_untune:
             print(sum(sim_list_untune) / len(sim_list_untune), np.std(sim_list_untune))
-        quantiles_fail = np.quantile(sim_list_untune, [0.1, 0.2, 0.5, 0.8, 0.9])
-        print(quantiles_fail)
+            quantiles_fail = np.quantile(sim_list_untune, [0.1, 0.2, 0.5, 0.8, 0.9])
+            print(quantiles_fail)
     return results
 
 

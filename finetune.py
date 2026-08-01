@@ -11,8 +11,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 import json
-from datasets import load_dataset
+from datasets import load_dataset, disable_caching
 import shutil
+
+# Multi-rank torchrun starts all ranks at once, and each one builds the dataset.
+# Letting every rank write the shared on-disk HF datasets cache races: one rank
+# renames its ".incomplete" build dir out from under another mid-write, raising
+# FileNotFoundError on a *.arrow file and killing the job before training. Keep
+# the dataset in memory (see keep_in_memory below) so no rank touches that cache.
+disable_caching()
 from transformers import (
     default_data_collator,
     AutoConfig,
@@ -63,9 +70,17 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                              max_length=2048, debug=0, predictors=0, regular=False, train_all=False,
                              plain=False, front_pred=False, reverse_pred=False, unmask_assistant_special_tokens=False):
     """Load JSONL dataset and format for training with proper label masking"""
-    
-    # Load dataset
-    dataset = load_dataset('json', data_files=data_file)['train']
+
+    # Load dataset. Give each torchrun rank its own build cache dir so concurrent
+    # ranks never write the same path: sharing it races (one rank renames its
+    # ".incomplete" build dir out from under another → FileNotFoundError on a
+    # *.arrow file, killing the job). SLURM_JOB_ID is unique per array task, so
+    # this is also isolated across array tasks that land on the same node.
+    _rank = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    _cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"),
+                              f"hf_ds_{os.environ.get('SLURM_JOB_ID', os.getpid())}_rank{_rank}")
+    dataset = load_dataset('json', data_files=data_file,
+                           keep_in_memory=True, cache_dir=_cache_dir)['train']
     if  torch.cuda.current_device() == 0:
         print(f"Loaded {len(dataset)} examples from {data_file}")
     
@@ -585,13 +600,23 @@ class RepresentationTrainer(Trainer):
         last_token_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
         for i in range(inputs["input_ids_user"].shape[0]):
             length, length_user, length_assistant = last_token[i] + 1, last_token_user[i] + 1, last_token_assistant[i] + 1
-            inputs["input_ids_user"][i, length_user:length_user + length_assistant] = inputs["input_ids_assistant"][i, :length_assistant]
-            inputs["labels_user"][i, length_user:length_user + length_assistant] = inputs["labels_assistant"][i, :length_assistant]
+            # Clamp assistant length to available space to prevent index-out-of-bounds
+            available_space = inputs["input_ids_user"].shape[1] - length_user
+            lc = min(int(length_assistant), int(available_space))
+            inputs["input_ids_user"][i, length_user:length_user + lc] = inputs["input_ids_assistant"][i, :lc]
+            inputs["labels_user"][i, length_user:length_user + lc] = inputs["labels_assistant"][i, :lc]
             mask[i, :, 0:length, 0:length] = self._build_additive_mask(length)
             mask[i + batch_size, :, 0:length_user, 0:length_user] = self._build_additive_mask(length_user)
-            mask[i + batch_size, :, length_user:length_user + length_assistant, length_user:length_user + length_assistant] = self._build_additive_mask(length_assistant)
+            mask[i + batch_size, :, length_user:length_user + lc, length_user:length_user + lc] = self._build_additive_mask(lc)
+        # Store per-sample clamped assistant positions for use in compute_loss.
+        # _last_token_assistant is the position of the last assistant token
+        # within the packed (user + assistant) sequence, clamped to avoid
+        # pointing past the end when the assistant was truncated.
         self._last_token_user = last_token_user
-        self._last_token_assistant = last_token_assistant + last_token_user + 1
+        self._last_token_assistant = torch.clamp(
+            last_token_assistant + last_token_user + 1,
+            max=inputs["input_ids_user"].shape[1] - 1
+        )
         return {
                 "input_ids": torch.cat([inputs["input_ids"],
                                         inputs["input_ids_user"]], dim=0),
@@ -955,8 +980,9 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     training_args = TrainingArguments(
         output_dir=output_dir,
-        overwrite_output_dir=True,
-        
+        # (overwrite_output_dir removed: not a TrainingArguments arg in
+        # transformers 5.3.0; the output dir is already cleared just above.)
+
         # Training parameters
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -1018,7 +1044,7 @@ def main():
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=data_collator,
             callbacks=[flop_callback] if args.track_flop else [],
         )
@@ -1030,7 +1056,7 @@ def main():
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=data_collator,
             callbacks=[flop_callback] if args.track_flop else [],
             lbd=args.lbd,

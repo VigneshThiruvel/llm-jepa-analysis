@@ -224,3 +224,6 @@ CLAUDE.md
 summarize_logs.py
 # llm-jepa-analysis run outputs (seed-82 final configs; checkpoints are huge)
 final_runs_seed82/
+
+# observational sweep run outputs (checkpoints + geometry per (λ,k,seed))
+sweep_runs/

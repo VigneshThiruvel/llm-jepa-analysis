@@ -821,6 +821,7 @@ def main():
     parser.add_argument("--split_seed", type=int, default=42, help="Random seed for train/eval split")
     parser.add_argument("--finetune_seed", type=int, default=42, help="Random seed for fine-tuning")
     parser.add_argument("--predictors", type=int, default=0, help="Number of predictor tokens")
+    parser.add_argument("--save_epoch_checkpoints", action="store_true", help="Save a model-only checkpoint at the end of every epoch (trajectory checkpoints for geometry measurements). Opt-in; default keeps the upstream step-based saving.")
     parser.add_argument("--lbd", type=float, default=0.1, help="Lambda for similarity loss")
     parser.add_argument("--gamma", type=float, default=1.0, help="Gamma for LLM loss")
     parser.add_argument("--last_token", type=int, default=-1, help="Index of last token, -1 is '<|eot|>'")
@@ -994,8 +995,12 @@ def main():
         eval_strategy="no",  # "steps" if eval_dataset else "no",
         # eval_steps=eval_steps,
         
-        # Saving
-        save_strategy="steps",
+        # Saving — with --save_epoch_checkpoints: per-epoch, model-only
+        # (no optimizer state) trajectory checkpoints for geometry. Without it:
+        # the upstream step-based full checkpoints. Default path is unchanged, so
+        # the replication script (which does not pass the flag) is unaffected.
+        save_strategy="epoch" if args.save_epoch_checkpoints else "steps",
+        save_only_model=args.save_epoch_checkpoints,
         save_steps=save_steps,
         save_total_limit=args.num_epochs * 4,
 

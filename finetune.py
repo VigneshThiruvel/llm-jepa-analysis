@@ -34,6 +34,15 @@ from peft import LoraConfig, get_peft_model, TaskType
 import argparse
 
 
+# Predictor tokens are registered as real special tokens so each one occupies a
+# single learned embedding. A `<|predictor_i|>` above this ceiling is NOT in the
+# vocab and falls back to ordinary BPE — `<|predictor_16|>` becomes 8 text tokens
+# — which silently changes what the k axis means instead of failing. Raise this in
+# lockstep with the largest k in the sweep; `main()` asserts k stays under it.
+# (Was 10 through tranche 2; raised to 32 on 2026-08-11 for tranche 3.)
+MAX_PREDICTORS = 32
+
+
 def get_messages(model_name, messages):
     if "google/gemma" in model_name:
         full_messages = copy.deepcopy(messages)[1:3]
@@ -451,9 +460,8 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
         if torch.cuda.current_device() == 0:
             print("Added <|startoftext|> token")
 
-    special_tokens = ["<|predictor_1|>", "<|predictor_2|>", "<|predictor_3|>", "<|predictor_4|>", "<|predictor_5|>",
-                      "<|predictor_6|>", "<|predictor_7|>", "<|predictor_8|>", "<|predictor_9|>", "<|predictor_10|>",
-                      "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|perception|>"]
+    special_tokens = [f"<|predictor_{i}|>" for i in range(1, MAX_PREDICTORS + 1)] + \
+                     ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|perception|>"]
     new_tokens = [token for token in special_tokens if token not in tokenizer.vocab]
     
     if new_tokens:
@@ -772,7 +780,23 @@ class RepresentationTrainer(Trainer):
         if self.debug == 5 and torch.cuda.current_device() == 0:
             print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
 
+        # Stash the two loss components for `log()` below. The Trainer only ever
+        # logs `total_loss = gamma*lm_loss + lbd*jepa_loss`, whose scale is set by
+        # lbd — so at large lbd the logged loss says nothing about whether the LM
+        # is still learning. Recording the parts separately is the only way to
+        # tell "the JEPA term didn't converge" from "the LM broke" after the fact.
+        # Diagnostic only: nothing here feeds the graph or changes numerics.
+        self._last_lm_loss = float(lm_loss.detach())
+        self._last_jepa_loss = float(jepa_loss.detach()) if torch.is_tensor(jepa_loss) else float(jepa_loss)
+
         return (total_loss, main_outputs) if return_outputs else total_loss
+
+    def log(self, logs, *args, **kwargs):
+        """Attach the loss components to every logged step (rank-0 local values)."""
+        if getattr(self, "_last_lm_loss", None) is not None and "loss" in logs:
+            logs.setdefault("lm_loss", self._last_lm_loss)
+            logs.setdefault("jepa_loss", self._last_jepa_loss)
+        return super().log(logs, *args, **kwargs)
 
 
 class ProfilerFLOPCallback(TrainerCallback):
@@ -845,6 +869,14 @@ def main():
     args = parser.parse_args()
     
     # Validate arguments
+    if args.predictors > MAX_PREDICTORS:
+        parser.error(
+            f"--predictors={args.predictors} exceeds MAX_PREDICTORS={MAX_PREDICTORS}. "
+            "Above the ceiling the predictor markers are not special tokens and get "
+            "BPE'd into ordinary text, which silently changes the k axis. Raise "
+            "MAX_PREDICTORS in finetune.py instead of running this."
+        )
+
     if not args.train_file and not args.data_file:
         parser.error("Must provide either --train_file or --data_file")
     

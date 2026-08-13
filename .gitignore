@@ -227,3 +227,10 @@ final_runs_seed82/
 
 # observational sweep run outputs (checkpoints + geometry per (λ,k,seed))
 sweep_runs/
+
+# working record of every modification to this folder (see CLAUDE.md)
+LOGBOOK.md
+
+# plot_sweep.py output, and the local copy of the CSVs it reads
+figures/
+data/

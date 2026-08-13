@@ -187,8 +187,14 @@ def load_model_and_tokenizer(model_name, original_model_name, load_in_8bit=False
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load model
-    special_tokens = ["<|predictor_1|>", "<|predictor_2|>", "<|predictor_3|>", "<|predictor_4|>", "<|predictor_5|>",
-                      "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|perception|>"]
+    # Must cover finetune.py's MAX_PREDICTORS: checkpoints are saved with that
+    # many extra embedding rows, and Llama-3.2 ties embeddings to the LM head, so
+    # a heavily-trained predictor row can be emitted at generation time. Keeping
+    # the tokenizer's vocab in step makes such an id decodable instead of garbage.
+    # Prompts never contain predictor tokens, so registering more cannot change
+    # how any existing test input is encoded — earlier results stay comparable.
+    special_tokens = [f"<|predictor_{i}|>" for i in range(1, 33)] + \
+                     ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|perception|>"]
     new_tokens = [token for token in special_tokens if token not in tokenizer.vocab]
     if new_tokens:
         tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})

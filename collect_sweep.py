@@ -55,7 +55,7 @@ import re
 
 RATE_PATTERN = re.compile(r"^Success Rate: (?:\S+), (?P<rate>[\d.]+)", re.MULTILINE)
 
-GEO_ID_COLS = ["lbd", "k", "seed", "step", "split", "layer", "n"]
+GEO_ID_COLS = ["dataset", "model", "lbd", "k", "seed", "step", "split", "layer", "n"]
 GEO_METRIC_COLS = [
     "rankme_text", "rankme_code",
     "uniformity_text", "uniformity_code",
@@ -63,7 +63,11 @@ GEO_METRIC_COLS = [
 ]
 
 ACC_COLS = [
-    # key + verdict first, so the verdict is impossible to miss in a join
+    # Identity first. Every run dir writes the same basenames, so a row that
+    # travels (copied to a laptop, concatenated with another dataset) must carry
+    # its own dataset and model rather than relying on which folder it sat in.
+    "dataset", "model",
+    # key + verdict next, so the verdict is impossible to miss in a join
     "lbd", "k", "seed", "arm", "status", "accuracy", "accuracy_raw", "status_detail",
     # training diagnostics (scale-free comparisons only; see module docstring)
     "loss_first", "loss_last", "train_loss",
@@ -128,7 +132,8 @@ def training_health(run_dir):
                       (fallback when lm_loss was not logged for this cell)
     """
     diag = {c: None for c in ACC_COLS if c not in
-            ("lbd", "k", "seed", "arm", "status", "accuracy", "accuracy_raw", "status_detail")}
+            ("dataset", "model", "lbd", "k", "seed", "arm",
+             "status", "accuracy", "accuracy_raw", "status_detail")}
 
     state_file = _load_trainer_state(run_dir)
     if state_file is None:
@@ -225,7 +230,14 @@ def main():
             continue
         with open(config_file) as f:
             cfg = json.load(f)
-        meta = {"lbd": cfg["lbd"], "k": cfg["k"], "seed": cfg["seed"], "arm": cfg["arm"]}
+        # Fall back to the run dir's parent for pre-2026-08-16 cells whose
+        # config.json predates these fields.
+        ident = {
+            "dataset": cfg.get("dataset") or os.path.basename(os.path.dirname(run_dir.rstrip("/"))),
+            "model": cfg.get("model", "unknown"),
+        }
+        meta = {**ident, "lbd": cfg["lbd"], "k": cfg["k"],
+                "seed": cfg["seed"], "arm": cfg["arm"]}
 
         cell_geometry = []
         geometry_file = os.path.join(run_dir, "geometry.jsonl")
@@ -234,7 +246,9 @@ def main():
                 for line in f:
                     line = line.strip()
                     if line:
-                        cell_geometry.append(json.loads(line))
+                        # geometry.jsonl rows carry only (lbd,k,seed,step,...);
+                        # stamp identity on so the table stands alone.
+                        cell_geometry.append({**ident, **json.loads(line)})
             geometry_rows.extend(cell_geometry)
         else:
             print(f"[collect] missing {geometry_file}")
@@ -287,9 +301,28 @@ def main():
         os.replace(tmp, path)
         print(f"[collect] wrote {len(rows)} rows to {path}")
 
-    write_csv(os.path.join(args.runs_dir, "accuracy_tidy.csv"), accuracy_rows, ACC_COLS)
-    write_csv(os.path.join(args.runs_dir, "geometry_tidy.csv"),
-              geometry_rows, GEO_ID_COLS + GEO_METRIC_COLS)
+    # One pair of CSVs per (dataset, model), with both in the filename. Every
+    # runs_dir used to write the same two basenames, so copying synth's and
+    # turk's tables into one folder silently clobbered one of them; a second
+    # model in the same runs_dir would have done the same. Both are now
+    # distinguishable by name AND self-identifying by column.
+    groups = sorted({(r["dataset"], r["model"]) for r in accuracy_rows} |
+                    {(r["dataset"], r["model"]) for r in geometry_rows})
+    for dataset, model in groups:
+        slug = f"{dataset}_{model.split('/')[-1]}"
+        acc_g = [r for r in accuracy_rows if (r["dataset"], r["model"]) == (dataset, model)]
+        geo_g = [r for r in geometry_rows if (r["dataset"], r["model"]) == (dataset, model)]
+        write_csv(os.path.join(args.runs_dir, f"accuracy_tidy_{slug}.csv"), acc_g, ACC_COLS)
+        write_csv(os.path.join(args.runs_dir, f"geometry_tidy_{slug}.csv"),
+                  geo_g, GEO_ID_COLS + GEO_METRIC_COLS)
+
+    # Pre-2026-08-16 unsuffixed files are no longer updated; say so rather than
+    # leaving a stale table that looks current.
+    for legacy in ("accuracy_tidy.csv", "geometry_tidy.csv"):
+        p = os.path.join(args.runs_dir, legacy)
+        if os.path.exists(p):
+            print(f"[collect] NOTE: {p} is legacy and no longer updated — safe to delete "
+                  f"(regenerated as accuracy_tidy_<dataset>_<model>.csv)")
 
     # Human-readable failure log: the failure mode itself, not a score standing
     # in for it. Rewritten from scratch each pass, like the CSVs.

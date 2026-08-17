@@ -6,9 +6,12 @@
 #SBATCH --gres=gpu:4
 #SBATCH --time=08:00:00
 #SBATCH --partition=dc-hwai
-#SBATCH --array=0-91
-#SBATCH --output=slurm/logs/thesis/sweep_synth_%A_%a.out
-#SBATCH --error=slurm/logs/thesis/sweep_synth_%A_%a.err
+#SBATCH --array=0-233
+# Dataset is a runtime knob (DS=...), which #SBATCH cannot interpolate — so the
+# filename carries the job id, not "synth", or turk/gsm8k logs land under a
+# synth name. The dataset is echoed in the first lines of each log.
+#SBATCH --output=slurm/logs/thesis/sweep_%A_%a.out
+#SBATCH --error=slurm/logs/thesis/sweep_%A_%a.err
 
 # Observational sweep — SYNTH, per CLAUDE.md. Two tranches, one array.
 #
@@ -33,6 +36,64 @@
 # RERUN=1 forces a full redo of the cell.
 
 set -euo pipefail
+
+# --- Grid definition -------------------------------------------------------
+# Kept above the module/GPU setup so `NCONFIGS=1 ./run_sweep.sh` can report the
+# array size from a login node, and so a bad --array fails before booking a node.
+#
+# Dataset and seed set are the only knobs; the λ×k grid is identical for every
+# (dataset, seed). lr is fixed per dataset — only λ, k, seed vary.
+#   synth, 3 seeds (default):  sbatch --array=0-233 run_sweep.sh
+#   turk,  1 seed:             DS=turk SEEDS=82 sbatch --array=0-77 run_sweep.sh
+#   gsm8k, 1 seed:             DS=gsm8k SEEDS=82 sbatch --array=0-77 run_sweep.sh
+# Outputs stay namespaced per dataset under sweep_runs/<DS>/, so each dataset
+# gets its own accuracy_tidy.csv / geometry_tidy.csv with no renaming; seed is
+# already a column, so extra seeds just add rows to that dataset's existing CSVs.
+DS=${DS:-synth}
+case "${DS}" in
+  synth|turk) LR=2e-5; MAX_NEW_TOKENS=256 ;;
+  # gsm8k needs the chain-of-thought before "#### <answer>", hence the larger budget.
+  gsm8k)      LR=2e-5; MAX_NEW_TOKENS=512 ;;
+  *) echo "unknown dataset '${DS}' (expected synth|turk|gsm8k)" >&2; exit 1 ;;
+esac
+
+# The grid, generated per seed: one no-JEPA baseline (λ=0, k is a no-op there)
+# plus every λ×k combination. λ>0 includes k=0, which decouples k from the
+# JEPA-on/off contrast — k=0 is JEPA *without* predictor tokens, not the baseline.
+#
+# λ are STRINGS, not numbers, and must keep this exact spelling (0.5 / 1.0 / 2.0,
+# never .5 / 1 / 2): the tag <λ>_<k>_<seed> is the on-disk directory name, so a
+# reformatted λ misses the skip guard and silently retrains a finished cell.
+# k ≤ MAX_PREDICTORS (32) in finetune.py — above that the marker is not a special
+# token and BPEs into ordinary text, silently changing what the k axis means.
+LBDS=(0.125 0.25 0.5 1.0 2.0 4.0 8.0 16.0 32.0 64.0 128.0)
+KS=(0 1 2 4 8 16 32)
+read -r -a SEEDS <<< "${SEEDS:-82 23 37}"
+
+# 4th field "purge": delete checkpoints once accuracy AND geometry are captured
+# (~12 GB/cell otherwise, and this expansion is 220 new cells). Finished cells
+# exit at the completeness guard further down before ever reaching the purge
+# step, so the tranche-1/2 seed-82 checkpoints already on disk are not touched.
+CONFIGS=()
+for S in "${SEEDS[@]}"; do
+  CONFIGS+=("0.0 0 ${S} purge")
+  for L in "${LBDS[@]}"; do
+    for K in "${KS[@]}"; do
+      CONFIGS+=("${L} ${K} ${S} purge")
+    done
+  done
+done
+
+# Submitting with a wrong --array silently truncates or overruns the grid, so
+# fail loudly instead: `NCONFIGS=1 ./run_sweep.sh` prints the size to use.
+if [ -n "${NCONFIGS:-}" ]; then
+  echo "${DS}: ${#CONFIGS[@]} cells for seeds '${SEEDS[*]}' -> --array=0-$(( ${#CONFIGS[@]} - 1 ))"
+  exit 0
+fi
+if [ "${SLURM_ARRAY_TASK_ID:-0}" -ge "${#CONFIGS[@]}" ]; then
+  echo "task ${SLURM_ARRAY_TASK_ID} >= ${#CONFIGS[@]} configs for DS=${DS} seeds='${SEEDS[*]}'" >&2
+  exit 1
+fi
 
 VENV_DIR=/p/project1/westai0096/vignesh_thesis/jepa/.venv
 HF_CACHE_DIR=/p/project1/westai0096/vignesh_thesis/jepa/.cache/huggingface
@@ -62,58 +123,10 @@ export MASTER_ADDR=$(hostname -I | awk '{print $1}')
 export MASTER_PORT=$((29500 + SLURM_ARRAY_TASK_ID))
 
 MODEL=meta-llama/Llama-3.2-1B-Instruct
-DS=synth
-DATASET=datasets/${DS}
-LR=2e-5                 # SYNTH lr is fixed across all cells (only λ, k, seed vary)
 EPOCHS=4
-MAX_NEW_TOKENS=256
+DATASET=datasets/${DS}
 RUNS_DIR=sweep_runs/${DS}
 
-# "lbd k seed". λ=0 rows are the no-JEPA baseline (k is a no-op there, run once
-# per seed). λ>0 rows are JEPA, including k=0 at nonzero λ (decouples k from the
-# JEPA-on/off contrast, as the pilot flagged).
-#
-# λ strings must match the existing on-disk tags exactly (0.5 / 1.0 / 2.0, not
-# .5 / 1 / 2) or the skip guard misses and the cell retrains. k ≤ 10: predictor
-# tokens are registered as <|predictor_1|>…<|predictor_10|> in finetune.py.
-CONFIGS=(
-  # --- tranche 1: seed precision, 3 seeds (already on disk) ---
-  "0.0 0 82"  "0.0 0 23"  "0.0 0 37"
-  "0.5 0 82"  "0.5 0 23"  "0.5 0 37"
-  "0.5 1 82"  "0.5 1 23"  "0.5 1 37"
-  "1.0 0 82"  "1.0 0 23"  "1.0 0 37"
-  "1.0 1 82"  "1.0 1 23"  "1.0 1 37"
-  "2.0 0 82"  "2.0 0 23"  "2.0 0 37"
-  "2.0 1 82"  "2.0 1 23"  "2.0 1 37"
-  # --- tranche 2: extreme λ×k dose-response, seed 82 only (44 new cells) ---
-  "0.125 0 82"  "0.125 1 82"  "0.125 2 82"  "0.125 4 82"  "0.125 8 82"
-  "0.25 0 82"   "0.25 1 82"   "0.25 2 82"   "0.25 4 82"   "0.25 8 82"
-  "0.5 2 82"    "0.5 4 82"    "0.5 8 82"
-  "1.0 2 82"    "1.0 4 82"    "1.0 8 82"
-  "2.0 2 82"    "2.0 4 82"    "2.0 8 82"
-  "4.0 0 82"    "4.0 1 82"    "4.0 2 82"    "4.0 4 82"    "4.0 8 82"
-  "8.0 0 82"    "8.0 1 82"    "8.0 2 82"    "8.0 4 82"    "8.0 8 82"
-  "16.0 0 82"   "16.0 1 82"   "16.0 2 82"   "16.0 4 82"   "16.0 8 82"
-  "32.0 0 82"   "32.0 1 82"   "32.0 2 82"   "32.0 4 82"   "32.0 8 82"
-  "64.0 0 82"   "64.0 1 82"   "64.0 2 82"   "64.0 4 82"   "64.0 8 82"
-  # --- tranche 3: k up to 32 and lambda up to 128, seed 82 (27 new cells) ---
-  # 4th field "purge" = delete checkpoints once accuracy AND geometry are captured.
-  # Needs finetune.py MAX_PREDICTORS >= 32 (raised 2026-08-11); below that ceiling
-  # <|predictor_16|> is not a special token and BPEs into 8 text tokens.
-  "0.125 16 82 purge"  "0.125 32 82 purge"
-  "0.25 16 82 purge"   "0.25 32 82 purge"
-  "0.5 16 82 purge"    "0.5 32 82 purge"
-  "1.0 16 82 purge"    "1.0 32 82 purge"
-  "2.0 16 82 purge"    "2.0 32 82 purge"
-  "4.0 16 82 purge"    "4.0 32 82 purge"
-  "8.0 16 82 purge"    "8.0 32 82 purge"
-  "16.0 16 82 purge"   "16.0 32 82 purge"
-  "32.0 16 82 purge"   "32.0 32 82 purge"
-  "64.0 16 82 purge"   "64.0 32 82 purge"
-  "128.0 0 82 purge"   "128.0 1 82 purge"   "128.0 2 82 purge"   "128.0 4 82 purge"
-  "128.0 8 82 purge"   "128.0 16 82 purge"  "128.0 32 82 purge"
-)
-# KEEP is empty for tranche 1/2 rows (3 fields), so those keep their checkpoints.
 read -r LBD K SEED KEEP <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
 
 if [ "${LBD}" = "0.0" ]; then ARM=baseline; else ARM=jepa; fi

@@ -54,6 +54,12 @@ import os
 import re
 
 RATE_PATTERN = re.compile(r"^Success Rate: (?:\S+), (?P<rate>[\d.]+)", re.MULTILINE)
+# Prefix match, written by diagnostics/eval_generations.py into results_prefix.txt
+# (a file that is only ever added next to results.txt, never replaces it). Exact
+# match conflates task competence with termination — a cell can emit the exact
+# gold answer and score 0 because it never stops — so the two are collected as
+# separate columns and never summed.
+PREFIX_PATTERN = re.compile(r"^Prefix Rate: (?:\S+), (?P<rate>[\d.]+)", re.MULTILINE)
 
 GEO_ID_COLS = ["dataset", "model", "lbd", "k", "seed", "step", "split", "layer", "n"]
 GEO_METRIC_COLS = [
@@ -69,6 +75,9 @@ ACC_COLS = [
     "dataset", "model",
     # key + verdict next, so the verdict is impossible to miss in a join
     "lbd", "k", "seed", "arm", "status", "accuracy", "accuracy_raw", "status_detail",
+    # prefix match + the exact rate re-measured on the same generations (blank
+    # until a cell has been through eval_generations.py; see PREFIX_PATTERN)
+    "accuracy_prefix", "accuracy_prefix_raw", "accuracy_exact_recheck",
     # training diagnostics (scale-free comparisons only; see module docstring)
     "loss_first", "loss_last", "train_loss",
     "lm_loss_first", "lm_loss_last", "jepa_loss_first", "jepa_loss_last",
@@ -131,9 +140,13 @@ def training_health(run_dir):
       not_converged — total loss ended at or above its first logged value
                       (fallback when lm_loss was not logged for this cell)
     """
+    # Every ACC_COL this function does NOT own must be listed here: the row
+    # splats `diag` after the fields main() sets, so a missing name here silently
+    # overwrites a real value with None.
     diag = {c: None for c in ACC_COLS if c not in
             ("dataset", "model", "lbd", "k", "seed", "arm",
-             "status", "accuracy", "accuracy_raw", "status_detail")}
+             "status", "accuracy", "accuracy_raw", "status_detail",
+             "accuracy_prefix", "accuracy_prefix_raw", "accuracy_exact_recheck")}
 
     state_file = _load_trainer_state(run_dir)
     if state_file is None:
@@ -268,6 +281,23 @@ def main():
         if rate is None:
             continue  # cell has not been evaluated yet; nothing to report
 
+        # Optional prefix-match sidecar. Absent for cells that predate
+        # eval_generations.py, so these columns stay blank rather than guessed.
+        prefix_rate = recheck = None
+        # results_prefix.txt for a sweep cell backfilled after the fact (its
+        # results.txt must not be rewritten); results.txt itself for a cell that
+        # was scored with eval_generations.py in the first place.
+        prefix_file = os.path.join(run_dir, "results_prefix.txt")
+        if not os.path.exists(prefix_file):
+            prefix_file = results_file
+        if os.path.exists(prefix_file):
+            with open(prefix_file) as f:
+                text = f.read()
+            pm = PREFIX_PATTERN.search(text)
+            rm = RATE_PATTERN.search(text)
+            prefix_rate = float(pm.group("rate")) if pm else None
+            recheck = float(rm.group("rate")) if rm else None
+
         status, detail, diag = training_health(run_dir)
         row = {
             **meta,
@@ -276,6 +306,10 @@ def main():
             # silently averaged into a dose-response curve. Raw value kept below.
             "accuracy": rate if status == "ok" else None,
             "accuracy_raw": rate,
+            # Same discipline as `accuracy`: blank unless the run trained cleanly.
+            "accuracy_prefix": prefix_rate if status == "ok" else None,
+            "accuracy_prefix_raw": prefix_rate,
+            "accuracy_exact_recheck": recheck,
             "status_detail": detail,
             **diag,
             **final_geometry(cell_geometry),

@@ -49,7 +49,11 @@ add_if_purged() {
   local tag=$1
   [ -d "${RUNS_DIR}/${tag}" ] || return 0                       # never run at all
   [ -f "${RUNS_DIR}/${tag}/checkpoints/model.safetensors" ] && return 0  # has weights
-  grep -q "^Prefix Rate" "${RUNS_DIR}/${tag}/results_prefix.txt" 2>/dev/null && return 0
+  # NOTE: do NOT filter on results_prefix.txt here. The list must be identical for
+  # every array task; filtering on work already finished makes it shrink while the
+  # array runs, so later indices point at different cells or past the end (that is
+  # what killed tasks 15-26 of job 15617829 after ~19s each). The
+  # already-done check belongs after the index is resolved, below.
   CELLS+=("${tag}")
 }
 for S in "${SEEDS[@]}"; do
@@ -64,6 +68,9 @@ TASK=${SLURM_ARRAY_TASK_ID:-0}
 [ "${TASK}" -lt "${#CELLS[@]}" ] || { echo "task ${TASK} >= ${#CELLS[@]} cells" >&2; exit 1; }
 TAG=${CELLS[$TASK]}
 IFS=_ read -r LBD K SEED <<< "${TAG}"
+if [ -z "${RERUN:-}" ] && grep -q "^Prefix Rate" "${RUNS_DIR}/${TAG}/results_prefix.txt" 2>/dev/null; then
+  echo "=== ${TAG}: already has a prefix rate, skipping ==="; exit 0
+fi
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 [ -f finetune.py ] && [ -d diagnostics ] || { echo "submit from llm-jepa-analysis/" >&2; exit 1; }

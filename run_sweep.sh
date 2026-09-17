@@ -46,15 +46,22 @@ set -euo pipefail
 #   synth, 3 seeds (default):  sbatch --array=0-233 run_sweep.sh
 #   turk,  1 seed:             DS=turk SEEDS=82 sbatch --array=0-77 run_sweep.sh
 #   gsm8k, 1 seed:             DS=gsm8k SEEDS=82 sbatch --array=0-77 run_sweep.sh
+#   spider, full grid at 82 + tranche-1 cells at 23/37, per-example generations,
+#   checkpoints kept only for KEEP_TAGS (job command recorded in LOGBOOK 2026-09-17):
+#     DS=spider SEEDS=82 T1_SEEDS="23 37" GENERATIONS=1 KEEP_TAGS="…" sbatch --array=0-91 run_sweep.sh
 # Outputs stay namespaced per dataset under sweep_runs/<DS>/, so each dataset
 # gets its own accuracy_tidy.csv / geometry_tidy.csv with no renaming; seed is
 # already a column, so extra seeds just add rows to that dataset's existing CSVs.
 DS=${DS:-synth}
 case "${DS}" in
-  synth|turk) LR=2e-5; MAX_NEW_TOKENS=256 ;;
+  synth|turk) LR=2e-5; MAX_NEW_TOKENS=256; EVAL_EXTRA=() ;;
   # gsm8k needs the chain-of-thought before "#### <answer>", hence the larger budget.
-  gsm8k)      LR=2e-5; MAX_NEW_TOKENS=512 ;;
-  *) echo "unknown dataset '${DS}' (expected synth|turk|gsm8k)" >&2; exit 1 ;;
+  gsm8k)      LR=2e-5; MAX_NEW_TOKENS=512; EVAL_EXTRA=() ;;
+  # spider: lr 4e-5 is paper Table 13's value. 1e-5 (Fig 7b's label, upstream run.sh)
+  # underfits the schemas: 0.21 vs 0.51 at seed 82 (LOGBOOK 2026-09-17, job 15632321).
+  # Execution accuracy needs the sqlite DBs.
+  spider)     LR=4e-5; MAX_NEW_TOKENS=256; EVAL_EXTRA=(--spider_path=spider_data/database) ;;
+  *) echo "unknown dataset '${DS}' (expected synth|turk|gsm8k|spider)" >&2; exit 1 ;;
 esac
 
 # The grid, generated per seed: one no-JEPA baseline (λ=0, k is a no-op there)
@@ -69,17 +76,41 @@ esac
 LBDS=(0.125 0.25 0.5 1.0 2.0 4.0 8.0 16.0 32.0 64.0 128.0)
 KS=(0 1 2 4 8 16 32)
 read -r -a SEEDS <<< "${SEEDS:-82 23 37}"
+# T1_SEEDS: seeds that get only the tranche-1 cells (baseline + λ{0.5,1,2} × k{0,1},
+# 7 per seed), appended after the full grid. Empty by default, so the index → cell
+# mapping of every existing (DS, SEEDS) submission is unchanged.
+read -r -a T1_SEEDS <<< "${T1_SEEDS:-}"
+T1_LBDS=(0.5 1.0 2.0)
+T1_KS=(0 1)
+# KEEP_TAGS: <λ>_<k>_<seed> tags whose checkpoints are kept for later diagnosis; every
+# other cell is purged. Empty by default (everything purged, as before).
+read -r -a KEEP_TAGS <<< "${KEEP_TAGS:-}"
+keep_or_purge() {
+  local t
+  for t in "${KEEP_TAGS[@]+"${KEEP_TAGS[@]}"}"; do
+    [ "${t}" = "$1" ] && { echo keep; return; }
+  done
+  echo purge
+}
 
-# 4th field "purge": delete checkpoints once accuracy AND geometry are captured
-# (~12 GB/cell otherwise, and this expansion is 220 new cells). Finished cells
-# exit at the completeness guard further down before ever reaching the purge
-# step, so the tranche-1/2 seed-82 checkpoints already on disk are not touched.
+# 4th field "purge"/"keep": purge deletes checkpoints once accuracy AND geometry are
+# captured (~12 GB/cell otherwise). Finished cells exit at the completeness guard
+# further down before ever reaching the purge step, so the tranche-1/2 seed-82
+# checkpoints already on disk are not touched.
 CONFIGS=()
 for S in "${SEEDS[@]}"; do
-  CONFIGS+=("0.0 0 ${S} purge")
+  CONFIGS+=("0.0 0 ${S} $(keep_or_purge "0.0_0_${S}")")
   for L in "${LBDS[@]}"; do
     for K in "${KS[@]}"; do
-      CONFIGS+=("${L} ${K} ${S} purge")
+      CONFIGS+=("${L} ${K} ${S} $(keep_or_purge "${L}_${K}_${S}")")
+    done
+  done
+done
+for S in "${T1_SEEDS[@]+"${T1_SEEDS[@]}"}"; do
+  CONFIGS+=("0.0 0 ${S} $(keep_or_purge "0.0_0_${S}")")
+  for L in "${T1_LBDS[@]}"; do
+    for K in "${T1_KS[@]}"; do
+      CONFIGS+=("${L} ${K} ${S} $(keep_or_purge "${L}_${K}_${S}")")
     done
   done
 done
@@ -87,7 +118,9 @@ done
 # Submitting with a wrong --array silently truncates or overruns the grid, so
 # fail loudly instead: `NCONFIGS=1 ./run_sweep.sh` prints the size to use.
 if [ -n "${NCONFIGS:-}" ]; then
-  echo "${DS}: ${#CONFIGS[@]} cells for seeds '${SEEDS[*]}' -> --array=0-$(( ${#CONFIGS[@]} - 1 ))"
+  echo "${DS}: ${#CONFIGS[@]} cells for seeds '${SEEDS[*]}' + tranche-1 seeds '${T1_SEEDS[*]+${T1_SEEDS[*]}}'" \
+       "($(printf '%s\n' "${CONFIGS[@]}" | grep -c ' keep$' || true) kept) -> --array=0-$(( ${#CONFIGS[@]} - 1 ))"
+  [ -n "${LIST:-}" ] && printf '%s\n' "${CONFIGS[@]}" | nl -v0
   exit 0
 fi
 if [ "${SLURM_ARRAY_TASK_ID:-0}" -ge "${#CONFIGS[@]}" ]; then
@@ -190,9 +223,55 @@ if [ -n "${RERUN:-}" ] || ! grep -q "Success Rate" "${RUN_DIR}/results.txt" 2>/d
     --split_tune_untune \
     --original_model_name=${MODEL} \
     --max_new_tokens ${MAX_NEW_TOKENS} \
+    "${EVAL_EXTRA[@]+"${EVAL_EXTRA[@]}"}" \
     --nosplit_data | tee ${RUN_DIR}/results.txt
 else
   echo "=== ${TAG}: results.txt already has a success rate, skipping eval ==="
+fi
+
+# --- 2b. Per-example generations (opt-in: GENERATIONS=1) ---
+# evaluate.py writes no per-example rows, so once a cell is purged its score can't
+# be split into "hit the token cap / never emitted EOS" and "wrong answer". This
+# re-runs the same greedy generation through diagnostics/eval_generations.py
+# (sharded over the node's GPUs) and keeps generations.jsonl + summary.json +
+# report.txt under <cell>/generations/. The chat-template date is pinned to the
+# day evaluate.py ran (results.txt mtime), so the prompts are identical, and the
+# report says whether the rate reproduces results.txt. results.txt stays the
+# recorded accuracy. Nothing else in the cell dir is written. Runs before geometry,
+# so a failure here leaves the cell incomplete with its weights kept for retry.
+if [ -n "${GENERATIONS:-}" ]; then
+  GEN_DIR=${RUN_DIR}/generations
+  if [ -n "${RERUN:-}" ] || [ ! -s "${GEN_DIR}/summary.json" ]; then
+    rm -rf "${GEN_DIR}"; mkdir -p "${GEN_DIR}/shards"
+    GEN_DATE=$(date -r "${RUN_DIR}/results.txt" "+%d %b %Y")
+    IFS=, read -r -a GEN_GPUS <<< "${CUDA_VISIBLE_DEVICES}"
+    GEN_ARGS=(--model_name="${CKPT_DIR}" --original_model_name="${MODEL}"
+              --input_file="${DATASET}_test.jsonl" --out_dir="${GEN_DIR}"
+              --max_new_tokens="${MAX_NEW_TOKENS}" --date_string="${GEN_DATE}" --trace_n=0
+              "${EVAL_EXTRA[@]+"${EVAL_EXTRA[@]}"}")
+    echo "=== ${TAG}: per-example generations on ${#GEN_GPUS[@]} GPU(s), date_string='${GEN_DATE}' ==="
+    gen_pids=()
+    for g in "${!GEN_GPUS[@]}"; do
+      CUDA_VISIBLE_DEVICES=${GEN_GPUS[$g]} python3 diagnostics/eval_generations.py "${GEN_ARGS[@]}" \
+        --shard_id=${g} --num_shards=${#GEN_GPUS[@]} --device_map=cuda:0 \
+        > "${GEN_DIR}/shards/log.${g}.txt" 2>&1 &
+      gen_pids+=($!)
+    done
+    gen_rc=0; for p in "${gen_pids[@]}"; do wait "${p}" || gen_rc=1; done
+    if [ ${gen_rc} -ne 0 ]; then
+      tail -n 5 "${GEN_DIR}"/shards/log.*.txt >&2
+      echo "=== ${TAG}: generation shard failed ===" >&2; exit 1
+    fi
+    python3 diagnostics/eval_generations.py "${GEN_ARGS[@]}" --merge \
+      --reference_results="${RUN_DIR}/results.txt" | tee "${GEN_DIR}/report.txt"
+    if [ "${DS}" = "spider" ]; then
+      python3 diagnostics/spider_error_analysis.py --generations="${GEN_DIR}/generations.jsonl" \
+        | tee "${GEN_DIR}/taxonomy.txt"
+    fi
+    rm -rf "${GEN_DIR}/shards"
+  else
+    echo "=== ${TAG}: generations already present, skipping ==="
+  fi
 fi
 
 # --- 3. Geometry on every trajectory checkpoint (train + test splits) ---

@@ -16,7 +16,11 @@
 #   NL-RX-SYNTH    2e-5    1     1
 #   NL-RX-TURK     2e-5    1     1
 #   GSM8K          2e-5    0.5   4
-#   Spider         1e-5    1     3
+#   Spider         4e-5    1     3
+#
+# Spider lr is 4e-5 (paper Table 13). It was 1e-5 until 2026-09-17, taken from the
+# paper's Fig 7b label and upstream run.sh; at 1e-5 the model never memorises the
+# schemas and scores 0.21 vs the paper's 0.475 (LOGBOOK 2026-09-17, job 15632321).
 #
 # One array task per (dataset, arm) = 8 tasks. Each task trains, evaluates
 # accuracy, then re-gathers every finished run into the result CSVs, so the
@@ -68,8 +72,8 @@ CONFIGS=(
   "turk   jepa     2e-5 1   1"
   "gsm8k  baseline 2e-5 0   0"
   "gsm8k  jepa     2e-5 0.5 4"
-  "spider baseline 1e-5 0   0"
-  "spider jepa     1e-5 1   3"
+  "spider baseline 4e-5 0   0"
+  "spider jepa     4e-5 1   3"
 )
 read -r DS ARM LR LBD K <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
 

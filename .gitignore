@@ -235,3 +235,6 @@ LOGBOOK.md
 # plot_sweep.py output, and the local copy of the CSVs it reads
 figures/
 data/
+
+# paper PDF (arXiv 2509.14252v2), local reference copy
+paper/

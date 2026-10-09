@@ -21,7 +21,7 @@
 # baseline + λ{0.5,2.0} × k{1,2} -> 5 cells; default seeds {82,23} -> 10 cells.
 # Seeds are the paper's (CLAUDE.md seed hygiene), not the pilot's retired 42/123.
 #
-# Knobs: MODEL_KEY (openelm), ARM (control = upstream pad = eos | padfix = per-model PADFIX_TOKEN), DS (synth|turk),
+# Knobs: MODEL_KEY (openelm|gemma), ARM (control = upstream pad = eos | padfix = per-model PADFIX_TOKEN), DS (synth|turk),
 # SEEDS, CELLS (explicit "<λ>_<k>_<seed>" tags, replaces the grid), GRAD_ACCUM (default 4
 # = finetune.py's default; 8 gives effective batch 4×8×4 GPUs = 128, the authors' upstream
 # run.sh which trains on 8 GPUs × 4 × 4; outputs then go to <ARM>_bs128/), RERUN=1. Check the array size first:
@@ -64,14 +64,30 @@ case "${MODEL_KEY}" in
     # padfix pad: Llama-2 tokenizer's <unk> (id 0) — in the vocab with an embedding row,
     # never produced by byte-fallback SentencePiece, so it never occurs in the data.
     PADFIX_TOKEN='<unk>'
+    DEFAULT_PAD=eos     # Llama-2 tokenizer has no pad -> finetune.py uses </s>: collides
     JEPA_EXTRA=() ;;
-  *) echo "unknown MODEL_KEY '${MODEL_KEY}' (expected openelm)" >&2; exit 1 ;;
+  gemma)
+    MODEL=google/gemma-2-2b-it
+    LR=1e-5             # Table 12: baseline 33.65±3.24, JEPA 43.12±2.61 (λ2 k4); Fig 7c
+    # -2 = <end_of_turn> of the Text / Code turn (gemma ends a turn with <end_of_turn> \n;
+    # tokenizer pads left, which _last_token_index handles), after any predictor tokens.
+    LAST_TOKEN=-2
+    VENV_DIR=/p/project1/westai0096/vignesh_thesis/venv-tf4552   # authors' stack, as for OpenELM
+    COMPAT_PYTHONPATH=
+    # Default pad is <pad> (0) != <eos> (1) != <end_of_turn> (107): <end_of_turn> is labelled
+    # (400/400 on 200 rows). <eos> never occurs in the data, but the IT prior emits it right
+    # after <end_of_turn>, which is what evaluate.py stops on. No padfix arm for gemma.
+    PADFIX_TOKEN=
+    DEFAULT_PAD='<pad>'
+    JEPA_EXTRA=() ;;
+  *) echo "unknown MODEL_KEY '${MODEL_KEY}' (expected openelm|gemma)" >&2; exit 1 ;;
 esac
 case "${ARM}" in
   control) TRAIN_SCRIPT=finetune.py; PAD_ARGS=() ;;   # upstream: pad = eos, so eos is never labelled
   # finetune.py unchanged, pad swapped after setup (diagnostics/finetune_pad.py), so eos is
   # labelled. The checkpoint's saved tokenizer carries the new pad into eval/geometry.
-  padfix)  TRAIN_SCRIPT=diagnostics/finetune_pad.py; PAD_ARGS=(--pad_token="${PADFIX_TOKEN}") ;;
+  padfix)  [ -n "${PADFIX_TOKEN}" ] || { echo "no padfix arm for ${MODEL_KEY}: its default pad is not the turn terminator" >&2; exit 1; }
+           TRAIN_SCRIPT=diagnostics/finetune_pad.py; PAD_ARGS=(--pad_token="${PADFIX_TOKEN}") ;;
   *) echo "ARM '${ARM}' not implemented (expected control|padfix)" >&2; exit 1 ;;
 esac
 case "${DS}" in
@@ -140,7 +156,7 @@ echo "=== ${MODEL_KEY} ${DS} ${ARM} ${TAG}: ${CELL_ARM} lbd=${LBD} k=${K} seed=$
 cat > "${RUN_DIR}/config.json" <<EOF
 {"dataset": "${DS}", "arm": "${CELL_ARM}", "pad_arm": "${ARM}", "lr": "${LR}", "lbd": ${LBD}, "k": ${K},
  "seed": ${SEED}, "epochs": ${EPOCHS}, "model": "${MODEL}", "last_token": ${LAST_TOKEN},
- "pad_token": "$([ "${ARM}" = padfix ] && echo "${PADFIX_TOKEN}" || echo eos)", "grad_accum": ${GRAD_ACCUM}, "effective_batch": ${BATCH},
+ "pad_token": "$([ "${ARM}" = padfix ] && echo "${PADFIX_TOKEN}" || echo "${DEFAULT_PAD}")", "grad_accum": ${GRAD_ACCUM}, "effective_batch": ${BATCH},
  "additive_mask": $([ ${#JEPA_EXTRA[@]} -gt 0 ] && echo true || echo false), "max_new_tokens": ${MAX_NEW_TOKENS}}
 EOF
 

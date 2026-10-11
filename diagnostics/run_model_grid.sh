@@ -82,13 +82,28 @@ case "${MODEL_KEY}" in
     JEPA_EXTRA=() ;;
   *) echo "unknown MODEL_KEY '${MODEL_KEY}' (expected openelm|gemma)" >&2; exit 1 ;;
 esac
+EVAL_ONLY=; EVAL_CMD=(python3); EOS_LABEL=false; EVAL_STOP=
 case "${ARM}" in
   control) TRAIN_SCRIPT=finetune.py; PAD_ARGS=() ;;   # upstream: pad = eos, so eos is never labelled
   # finetune.py unchanged, pad swapped after setup (diagnostics/finetune_pad.py), so eos is
   # labelled. The checkpoint's saved tokenizer carries the new pad into eval/geometry.
   padfix)  [ -n "${PADFIX_TOKEN}" ] || { echo "no padfix arm for ${MODEL_KEY}: its default pad is not the turn terminator" >&2; exit 1; }
            TRAIN_SCRIPT=diagnostics/finetune_pad.py; PAD_ARGS=(--pad_token="${PADFIX_TOKEN}") ;;
-  *) echo "ARM '${ARM}' not implemented (expected control|padfix)" >&2; exit 1 ;;
+  # Test arms (gemma termination, LOGBOOK 2026-10-09):
+  # addmask  = control + --additive_mask on JEPA cells (the paper's 2-pass packing). With a
+  #            LEFT-padding tokenizer (gemma) the packing pools a <pad> as Code and unmasks the
+  #            left pads. Baseline cells (--regular) never use it: identical to control.
+  addmask)  TRAIN_SCRIPT=finetune.py; PAD_ARGS=(); JEPA_EXTRA+=(--additive_mask) ;;
+  # eoslabel = tokenizer eos appended to every full training conversation, so the token
+  #            evaluate.py stops on is a training target (diagnostics/finetune_eos.py).
+  eoslabel) TRAIN_SCRIPT=diagnostics/finetune_eos.py; PAD_ARGS=(); EOS_LABEL=true ;;
+  # stopeot  = eval-only: the control<suffix> checkpoints re-scored with generation stopping
+  #            on the turn marker instead of the tokenizer eos (diagnostics/eval_stop.py).
+  #            Weights identical to control, so trainer_state + geometry are copied.
+  stopeot)  [ "${MODEL_KEY}" = gemma ] || { echo "stopeot is defined for gemma only" >&2; exit 1; }
+            EVAL_ONLY=control; EVAL_STOP='<end_of_turn>'
+            EVAL_CMD=(python3 diagnostics/eval_stop.py --stop_token="${EVAL_STOP}") ;;
+  *) echo "ARM '${ARM}' not implemented (expected control|padfix|addmask|eoslabel|stopeot)" >&2; exit 1 ;;
 esac
 case "${DS}" in
   synth|turk) MAX_NEW_TOKENS=256 ;;
@@ -157,7 +172,8 @@ cat > "${RUN_DIR}/config.json" <<EOF
 {"dataset": "${DS}", "arm": "${CELL_ARM}", "pad_arm": "${ARM}", "lr": "${LR}", "lbd": ${LBD}, "k": ${K},
  "seed": ${SEED}, "epochs": ${EPOCHS}, "model": "${MODEL}", "last_token": ${LAST_TOKEN},
  "pad_token": "$([ "${ARM}" = padfix ] && echo "${PADFIX_TOKEN}" || echo "${DEFAULT_PAD}")", "grad_accum": ${GRAD_ACCUM}, "effective_batch": ${BATCH},
- "additive_mask": $([ ${#JEPA_EXTRA[@]} -gt 0 ] && echo true || echo false), "max_new_tokens": ${MAX_NEW_TOKENS}}
+ "additive_mask": $([ ${#JEPA_EXTRA[@]} -gt 0 ] && [ "${CELL_ARM}" = jepa ] && echo true || echo false), "train_eos_label": ${EOS_LABEL},
+ "eval_stop_token": "${EVAL_STOP:-eos}", "weights_from": "${EVAL_ONLY:+${EVAL_ONLY}${RUNS_SUFFIX}}", "max_new_tokens": ${MAX_NEW_TOKENS}}
 EOF
 
 trap 'python3 collect_sweep.py --runs_dir=${RUNS_DIR} || true; python3 diagnostics/collect_losses.py --runs_dir=${RUNS_DIR} || true' EXIT
@@ -167,8 +183,23 @@ if [ -z "${RERUN:-}" ] && grep -q "Success Rate" "${RUN_DIR}/results.txt" 2>/dev
   echo "=== ${TAG}: already complete, skipping ==="; exit 0
 fi
 
+# A finished save is model.safetensors, or a shard index when the weights exceed the
+# 5 GB shard size (gemma-2-2b: model-0000{1,2}-of-00002.safetensors + index).
+has_weights() { [ -f "$1/model.safetensors" ] || [ -f "$1/model.safetensors.index.json" ]; }
+
+# --- 0. Eval-only arms reuse another arm's finished cell (same weights).
+if [ -n "${EVAL_ONLY}" ]; then
+  SRC=diag_runs/models/${MODEL_KEY}/${DS}/${EVAL_ONLY}${RUNS_SUFFIX}/${TAG}
+  has_weights "${SRC}/checkpoints" && [ -s "${SRC}/geometry.jsonl" ] \
+    || { echo "eval-only arm needs a finished ${SRC}" >&2; exit 1; }
+  ln -sfn "$(realpath "${SRC}/checkpoints")" "${CKPT_DIR}"
+  cp -f "${SRC}/trainer_state.json" "${SRC}/geometry.jsonl" "${RUN_DIR}/"
+fi
+
 # --- 1. Train. --eval_steps=1 only sets logging_steps: lm_loss/jepa_loss every step.
-if [ -n "${RERUN:-}" ] || [ ! -f "${CKPT_DIR}/model.safetensors" ]; then
+if [ -n "${EVAL_ONLY}" ]; then
+  echo "=== ${TAG}: eval-only arm, weights from ${SRC} ==="
+elif [ -n "${RERUN:-}" ] || ! has_weights "${CKPT_DIR}"; then
   COMMON=(--train_file "${DATASET}_train.jsonl" --output_dir="${CKPT_DIR}"
           --num_epochs=${EPOCHS} --finetune_seed=${SEED}
           --model_name=${MODEL} --learning_rate=${LR}
@@ -189,7 +220,7 @@ fi
 # --- 2. Accuracy (exact match), exactly as run_sweep.sh scores a cell.
 if [ -n "${RERUN:-}" ] || ! grep -q "Success Rate" "${RUN_DIR}/results.txt" 2>/dev/null; then
   rm -f "${RUN_DIR}/eval.jsonl"
-  python3 evaluate.py --model_name="${CKPT_DIR}" --input_file="${DATASET}_test.jsonl" \
+  "${EVAL_CMD[@]}" evaluate.py --model_name="${CKPT_DIR}" --input_file="${DATASET}_test.jsonl" \
     --output_file="${RUN_DIR}/eval.jsonl" --split_tune_untune --original_model_name=${MODEL} \
     --max_new_tokens ${MAX_NEW_TOKENS} --nosplit_data | tee "${RUN_DIR}/results.txt"
 fi
@@ -211,14 +242,14 @@ if [ -n "${RERUN:-}" ] || [ ! -s "${GEN_DIR}/summary.json" ]; then
             --max_new_tokens="${MAX_NEW_TOKENS}" --trace_n=0)
   pids=()
   for g in "${!GEN_GPUS[@]}"; do
-    CUDA_VISIBLE_DEVICES=${GEN_GPUS[$g]} python3 diagnostics/eval_generations.py "${GEN_ARGS[@]}" \
+    CUDA_VISIBLE_DEVICES=${GEN_GPUS[$g]} "${EVAL_CMD[@]}" diagnostics/eval_generations.py "${GEN_ARGS[@]}" \
       --shard_id=${g} --num_shards=${#GEN_GPUS[@]} --device_map=cuda:0 \
       > "${GEN_DIR}/shards/log.${g}.txt" 2>&1 &
     pids+=($!)
   done
   rc=0; for p in "${pids[@]}"; do wait "${p}" || rc=1; done
   if [ ${rc} -ne 0 ]; then tail -n 20 "${GEN_DIR}"/shards/log.*.txt >&2; echo "generation shard failed" >&2; exit 1; fi
-  python3 diagnostics/eval_generations.py "${GEN_ARGS[@]}" --merge \
+  "${EVAL_CMD[@]}" diagnostics/eval_generations.py "${GEN_ARGS[@]}" --merge \
     --reference_results="${RUN_DIR}/results.txt" | tee "${GEN_DIR}/report.txt"
   rm -rf "${GEN_DIR}/shards"
 fi

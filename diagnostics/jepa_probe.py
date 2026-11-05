@@ -98,8 +98,12 @@ def branch_ids(tok, messages, k, side):
 
 
 @torch.no_grad()
-def pooled_states(model, tok, seqs, batch_size=32, last_token=-2):
-    """[N, L+1, D] states at len+last_token, plus next-token stats from the last layer."""
+def pooled_states(model, tok, seqs, batch_size=32, last_token=-2, pool="last"):
+    """[N, L+1, D] states at len+last_token, plus next-token stats from the last layer.
+
+    pool="mean" instead averages each layer over the branch's content span, from 2 tokens
+    after its last <|end_header_id|> through len+last_token (finetune_jepa_obj --jepa_pool=mean).
+    """
     eot = tok.convert_tokens_to_ids("<|eot_id|>")
     states, ent, p_eot, top_eot = [], [], [], []
     for s in range(0, len(seqs), batch_size):
@@ -114,7 +118,16 @@ def pooled_states(model, tok, seqs, batch_size=32, last_token=-2):
         out = model(input_ids=ids.to(model.device), attention_mask=mask.to(model.device),
                     output_hidden_states=True)
         r = torch.arange(len(chunk))
-        states.append(torch.stack([h[r, idx.to(h.device)] for h in out.hidden_states], 1).float().cpu())
+        if pool == "mean":
+            hdr = tok.convert_tokens_to_ids("<|end_header_id|>")
+            spans = []
+            for x, e in zip(chunk, idx.tolist()):
+                h_pos = [j for j in range(e + 1) if x[j] == hdr]
+                spans.append((min(h_pos[-1] + 2, e) if h_pos else e, e))
+            states.append(torch.stack([torch.stack([h[i, a:b + 1].mean(0) for i, (a, b) in enumerate(spans)])
+                                       for h in out.hidden_states], 1).float().cpu())
+        else:
+            states.append(torch.stack([h[r, idx.to(h.device)] for h in out.hidden_states], 1).float().cpu())
         logp = out.logits[r, idx.to(out.logits.device)].float().log_softmax(-1)
         ent.append(-(logp.exp() * logp).sum(-1).cpu())
         p_eot.append(logp[:, eot].exp().cpu())
@@ -156,7 +169,8 @@ def done_keys(out):
 def cmd_embed(a):
     meta = {"cell": os.path.basename(a.cell_dir.rstrip("/")), "dataset": a.dataset,
             "arm": a.arm, "lbd": a.lbd, "k": a.k, "seed": a.seed}
-    views = [("train", a.k)] + ([("raw", 0)] if a.k > 0 else [])
+    sfx = "" if a.pool == "last" else f"-{a.pool}"
+    views = [("train" + sfx, a.k)] + ([("raw" + sfx, 0)] if a.k > 0 else [])
     done = done_keys(a.out)
     todo = [(s, v) for s in ("test", "train") for v in views
             if (a.dataset, meta["cell"], s, v[0]) not in done]
@@ -170,8 +184,8 @@ def cmd_embed(a):
             for view, k in views:
                 if (split, (view, k)) not in todo:
                     continue
-                T, Te, Tp, Tt = pooled_states(model, tok, [branch_ids(tok, r["messages"], k, "text") for r in rows])
-                C, Ce, Cp, Ct = pooled_states(model, tok, [branch_ids(tok, r["messages"], k, "code") for r in rows])
+                T, Te, Tp, Tt = pooled_states(model, tok, [branch_ids(tok, r["messages"], k, "text") for r in rows], pool=a.pool)
+                C, Ce, Cp, Ct = pooled_states(model, tok, [branch_ids(tok, r["messages"], k, "code") for r in rows], pool=a.pool)
                 for layer in range(1, T.shape[1]):
                     X, Y = T[:, layer].to(model.device), C[:, layer].to(model.device)  # metrics on GPU
                     row = {**meta, "split": split, "view": view, "k_view": k, "layer": layer, "n": len(rows),
@@ -329,6 +343,8 @@ def main():
     e.add_argument("--dataset", default="synth")
     e.add_argument("--arm", default="padfix")
     e.add_argument("--n", type=int, default=1000)
+    e.add_argument("--pool", choices=["last", "mean"], default="last",
+                   help="last = the trained -2 position (Phase A); mean = content-span mean (view gets a -mean suffix)")
     e.add_argument("--out", required=True)
     pp = sub.add_parser("pairs")
     pp.add_argument("--pairs_file", required=True, help="TSV: kind, dataset, cell_a, cell_b")

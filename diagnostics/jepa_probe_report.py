@@ -52,7 +52,11 @@ def write_csv(path, rs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="diag_runs/jepa_null/phaseA")
+    ap.add_argument("--phase", choices=["A", "C"], default="A",
+                    help="C: <dir>/<arm>/<lbd>_<k>_<seed>/ layout from diagnostics/run_jepa_obj.sh")
     a = ap.parse_args()
+    if a.phase == "C":
+        return phase_c(a.dir)
     E = rows(os.path.join(a.dir, "embed.*.jsonl"))
     P = rows(os.path.join(a.dir, "pairs.*.jsonl"))
     write_csv(os.path.join(a.dir, "embed.csv"), E)
@@ -158,6 +162,78 @@ def main():
     rep = "\n".join(L)
     with open(os.path.join(a.dir, "report.txt"), "w") as f:
         f.write(rep + "\n")
+    print(rep)
+
+
+GATE_R1, GATE_GAP = 0.10, 0.10  # "real alignment" gate (plan, Phase C)
+
+
+def phase_c(root):
+    """One row per arm (mean over seeds): training tail, alignment gate at the trained
+    layer/pooling, accuracy and answer NLL, and distance to the same-seed base arm."""
+    cells = collections.defaultdict(list)
+    for d in sorted(glob.glob(os.path.join(root, "*", "*_*_*"))):
+        if os.path.exists(os.path.join(d, "config.json")):
+            cells[d.split(os.sep)[-2]].append(d)
+    P = rows(os.path.join(root, "pairs.*.jsonl"))
+    L = [f"Phase C report: {root}", "",
+         "gate = test split, trained layer + pooling: r1 >= %.2f and pos-neg gap >= %.2f (chance r1 = 0.001)"
+         % (GATE_R1, GATE_GAP), "",
+         f"{'arm':10} {'obj':8} {'lay':>3} {'pool':5} {'lbd':>5} {'n':>2} | {'jepa':>7} {'lm':>6} {'trR1':>5} | "
+         f"{'pos':>6} {'gap':>6} {'r1':>6} {'rkT':>5} {'rkC':>5} {'gate':>4} | {'exact':>6} {'prefix':>6} {'nll':>7} "
+         f"{'cap':>5} | {'KL/b':>7} {'arg≠':>6} {'dθ':>6} {'agree':>6}"]
+    order = lambda arm: (arm != "base", arm != "cos", arm)  # noqa: E731
+    for arm in sorted(cells, key=order):
+        per = []
+        for d in cells[arm]:
+            cfg = json.load(open(os.path.join(d, "config.json")))
+            r = {"cfg": cfg}
+            ts = os.path.join(d, "trainer_state.json")
+            if os.path.exists(ts):
+                hist = [h for h in json.load(open(ts)).get("log_history", []) if "lm_loss" in h]
+                tail = hist[-max(1, len(hist) // 10):]
+                for key in ("jepa_loss", "lm_loss", "jepa_r1"):
+                    r[key] = mean(h.get(key) for h in tail)
+            sp = os.path.join(d, "eval", "summary.json")
+            if os.path.exists(sp):
+                sm = json.load(open(sp))
+                r.update(exact=sm["accuracy"], prefix=sm["accuracy_prefix"], nll=sm["tf_gold_nll_mean"],
+                         cap=sm["frac_cap"])
+            pool = cfg.get("jepa_pool", "last")
+            layer = cfg.get("jepa_layer", "-1")
+            view = "train" + ("-mean" if pool == "mean" else "")
+            E = rows(os.path.join(d, "embed.*.jsonl"))
+            last = max((e["layer"] for e in E), default=16)
+            lay = last if layer in ("-", "-1") else int(layer)
+            g = [e for e in E if e["split"] == "test" and e["view"] == view and e["layer"] == lay]
+            if g:
+                e = g[0]
+                r.update(pos=e["pos_cos"], gap=e["gap"], r1=e["r1_t2c"], rkT=e["rankme_t"], rkC=e["rankme_c"])
+            pr = [x for x in P if x["kind"] == "jepa_vs_base" and os.path.normpath(x["b"]) == os.path.normpath(d)]
+            if pr:
+                r.update(kl=pr[0]["kl_sym"], dis=pr[0]["argmax_disagree"], dth=pr[0]["dtheta_rel"],
+                         agree=pr[0].get("match_agree"))
+            per.append(r)
+        cfg = per[0]["cfg"]
+        m = lambda k: mean(x.get(k) for x in per)  # noqa: E731
+        gate = "-" if arm == "base" else ("PASS" if m("r1") >= GATE_R1 and m("gap") >= GATE_GAP else "fail")
+        f = lambda v, w, p: (f"{v:{w}.{p}f}" if v == v else "-".rjust(w))  # noqa: E731  (nan -> '-')
+        L.append(f"{arm:10} {cfg.get('jepa_obj', '-'):8} {str(cfg.get('jepa_layer', '-')):>3} "
+                 f"{cfg.get('jepa_pool', '-'):5} {cfg['lbd']:5g} {len(per):2d} | {f(m('jepa_loss'), 7, 4)} "
+                 f"{f(m('lm_loss'), 6, 3)} {f(m('jepa_r1'), 5, 2)} | {f(m('pos'), 6, 3)} {f(m('gap'), 6, 3)} "
+                 f"{f(m('r1'), 6, 3)} {f(m('rkT'), 5, 1)} {f(m('rkC'), 5, 1)} {gate:>4} | {f(m('exact'), 6, 4)} "
+                 f"{f(m('prefix'), 6, 4)} {f(m('nll'), 7, 4)} {f(m('cap'), 5, 3)} | {f(m('kl'), 7, 4)} "
+                 f"{f(m('dis'), 6, 4)} {f(m('dth'), 6, 4)} {f(m('agree'), 6, 4)}")
+    bs = [x for x in P if x["kind"] == "base_seed"]
+    if bs:
+        L.append(f"seed noise (base vs base): KL {mean(x['kl_sym'] for x in bs):.4f}  "
+                 f"arg≠ {mean(x['argmax_disagree'] for x in bs):.4f}  dθ {mean(x['dtheta_rel'] for x in bs):.4f}")
+    L += ["", "columns: jepa/lm/trR1 = mean of the last 10% of logged steps (trR1 = in-batch top-1, 64-way);",
+          "pos/gap/r1/rk = jepa_probe embed at the trained layer and pooling; exact/prefix/nll/cap = eval/summary.json;",
+          "KL/b, arg≠, dθ, agree = vs the same-seed base arm (teacher-forced test gold, jepa_probe pairs)."]
+    rep = "\n".join(L)
+    with open(os.path.join(root, "report.txt"), "w") as fh:
+        fh.write(rep + "\n")
     print(rep)
 
 

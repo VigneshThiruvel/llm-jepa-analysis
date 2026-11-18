@@ -22,6 +22,12 @@ finetune_padfix (imported). Extra flags, popped before finetune's parser sees ar
                                         tokens after the branch's last <|end_header_id|>
                                         through the last_token position
   --jepa_gather=1|0               gather embeddings across ranks for infonce/vicreg
+  --jepa_obj=infonce_proj         infonce on g(T), g(C), g = Linear(D,D)-GELU-Linear(D,256), a
+                                  trainable head on the model (stripped from every save)
+  --jepa_obj=byol                 2 - 2 cos(q(g(T)), sg(g_t(C_t))), one-sided Text->Code; q =
+                                  Linear(256,512)-GELU-Linear(512,256); g_t / C_t from an EMA
+                                  copy of the whole model (--byol_tau 0.996), updated at the start
+                                  of every step (grad_accum must be 1), second no-grad forward
 
   --jepa_obj=cos --jepa_layer=-1 --jepa_pool=last reproduces finetune.py's term exactly.
 Requires --additive_mask (the only JEPA path the sweep uses). Logs, besides lm_loss /
@@ -48,16 +54,22 @@ JEPA_POOL = _pop_arg("jepa_pool", "last")
 JEPA_GATHER = _pop_arg("jepa_gather", "1") == "1"
 VIC_VAR = float(_pop_arg("vic_var", "1.0"))
 VIC_COV = float(_pop_arg("vic_cov", "0.04"))
-assert JEPA_OBJ in ("cos", "infonce", "vicreg"), JEPA_OBJ
+BYOL_TAU = float(_pop_arg("byol_tau", "0.996"))
+PROJ_DIM = 256
+assert JEPA_OBJ in ("cos", "infonce", "vicreg", "infonce_proj", "byol"), JEPA_OBJ
 assert JEPA_POOL in ("last", "mean"), JEPA_POOL
 
+import copy  # noqa: E402
+
 import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.distributed.nn.functional import all_gather  # noqa: E402
 
 import finetune  # noqa: E402 — imported, never modified
 
+HEADS = ("jepa_head", "jepa_pred")  # trainable modules hung on the model, never saved
 END_HEADER = 128007  # <|end_header_id|>; content starts after it and "\n\n" (271)
 
 
@@ -87,6 +99,66 @@ def pool(hidden, packed_ids, ends):
     return torch.stack(out)
 
 
+def mlp(d_in, d_hid, d_out, like):
+    w = like.get_input_embeddings().weight
+    return nn.Sequential(nn.Linear(d_in, d_hid), nn.GELU(), nn.Linear(d_hid, d_out)).to(w.device, w.dtype)
+
+
+def run(m, x):
+    """Apply a head in its own dtype (hidden states and heads can differ in dtype)."""
+    return m(x.to(next(m.parameters()).dtype))
+
+
+_setup = finetune.setup_model_and_tokenizer  # finetune_padfix's wrapper
+
+
+def setup_model_and_tokenizer(*args, **kwargs):
+    model, tokenizer = _setup(*args, **kwargs)
+    if JEPA_OBJ in ("infonce_proj", "byol"):
+        D = model.config.hidden_size
+        torch.manual_seed(kwargs.get("seed") or 0)
+        model.jepa_head = mlp(D, D, PROJ_DIM, model)
+        if JEPA_OBJ == "byol":
+            model.jepa_pred = mlp(PROJ_DIM, 2 * PROJ_DIM, PROJ_DIM, model)
+    return model, tokenizer
+
+
+finetune.setup_model_and_tokenizer = setup_model_and_tokenizer
+
+_save = finetune.RepresentationTrainer._save
+
+
+def _save_without_heads(self, *args, **kwargs):
+    m = self.accelerator.unwrap_model(self.model)
+    held = {h: m._modules.pop(h) for h in HEADS if h in m._modules}
+    try:
+        return _save(self, *args, **kwargs)
+    finally:
+        m._modules.update(held)
+
+
+_build = finetune.RepresentationTrainer.build_with_additive_mask
+
+
+def build_with_additive_mask(self, inputs):
+    out = _build(self, inputs)
+    self._llm_inputs = out[0]  # kept for byol's target forward
+    return out
+
+
+@torch.no_grad()
+def byol_target(self, model):
+    """EMA target, created from the online model on the first call and updated on every later one."""
+    online = self.accelerator.unwrap_model(model)
+    if getattr(self, "_target", None) is None:
+        self._target = copy.deepcopy(online).eval()
+        self._target.requires_grad_(False)
+    else:
+        for t, o in zip(self._target.parameters(), online.parameters()):
+            t.lerp_(o.detach(), 1.0 - BYOL_TAU)
+    return self._target
+
+
 def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
     assert self.additive_mask, "finetune_jepa_obj.py supports the --additive_mask path only"
     fr = self.forward(model, inputs)  # finetune's forward: packs Text+Code, one model call
@@ -109,10 +181,25 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
                 s0 = content_start(packed[0], e) if JEPA_POOL == "mean" else e
                 print(f"[jepa_obj debug] {name} span [{s0},{e}] layer {JEPA_LAYER}: "
                       f"{tok.decode(packed[0, s0:e + 1])!r}  next={tok.decode(packed[0, e + 1:e + 2])!r}", flush=True)
+        head = self.accelerator.unwrap_model(model)._modules.get("jepa_head")
+        if JEPA_OBJ == "infonce_proj":
+            u, a = run(head, u), run(head, a)  # gate stats below are on the projected z; the probe reads raw h
         pos = F.cosine_similarity(u, a, dim=-1)
-        if JEPA_OBJ == "cos":
+        if JEPA_OBJ == "byol":
+            assert self.args.gradient_accumulation_steps == 1, "byol's EMA step assumes grad_accum 1"
+            tgt = byol_target(self, model)
+            li = self._llm_inputs
+            with torch.no_grad():
+                ht = tgt(input_ids=li["input_ids"][B:2 * B], attention_mask=li["attention_mask"][B:2 * B],
+                         output_hidden_states=True).hidden_states[JEPA_LAYER]
+                zt = run(tgt.jepa_head, pool(ht, packed, self._last_token_assistant))
+            zu = run(head, u)
+            p = run(self.accelerator.unwrap_model(model).jepa_pred, zu)
+            jepa_loss = 2.0 - 2.0 * F.cosine_similarity(p.float(), zt.float(), dim=-1).mean()
+            self._byol_tgt_pos = float(F.cosine_similarity(zu.detach().float(), zt.float(), dim=-1).mean())
+        elif JEPA_OBJ == "cos":
             jepa_loss = 1.0 - pos.mean()
-        elif JEPA_OBJ == "infonce":
+        elif JEPA_OBJ in ("infonce", "infonce_proj"):
             a_all, off = gather(a)
             logits = F.normalize(u, dim=-1) @ F.normalize(a_all, dim=-1).T / JEPA_TAU
             jepa_loss = F.cross_entropy(logits, torch.arange(B, device=u.device) + off)
@@ -138,6 +225,8 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
                 "jepa_r1": float((S.argmax(1) == torch.arange(n, device=S.device)).float().mean()),
                 "jepa_n": n,
             }
+            if JEPA_OBJ == "byol":
+                self._diag["byol_tgt_pos"] = self._byol_tgt_pos
     total_loss = self.gamma * lm_loss + self.lbd * jepa_loss
     self._last_lm_loss = float(lm_loss.detach())
     self._last_jepa_loss = float(jepa_loss.detach()) if torch.is_tensor(jepa_loss) else float(jepa_loss)
@@ -156,9 +245,11 @@ def log(self, logs, *args, **kwargs):
 
 finetune.RepresentationTrainer.compute_loss = compute_loss
 finetune.RepresentationTrainer.log = log
+finetune.RepresentationTrainer._save = _save_without_heads
+finetune.RepresentationTrainer.build_with_additive_mask = build_with_additive_mask
 
 if __name__ == "__main__":
     if int(os.environ.get("LOCAL_RANK", "0")) == 0:
         print(f"[jepa_obj] obj={JEPA_OBJ} tau={JEPA_TAU} layer={JEPA_LAYER} pool={JEPA_POOL} "
-              f"gather={JEPA_GATHER} vic_var={VIC_VAR} vic_cov={VIC_COV}", flush=True)
+              f"gather={JEPA_GATHER} vic_var={VIC_VAR} vic_cov={VIC_COV} byol_tau={BYOL_TAU}", flush=True)
     finetune.main()

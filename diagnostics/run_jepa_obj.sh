@@ -16,7 +16,8 @@
 # (pad = <|finetune_right_pad_id|>, train/eval date pinned) and at batch layout bs 16 x accum 1
 # x 4 GPUs (= 64, as the sweep's 4 x 4 x 4) so InfoNCE sees 64-way negatives.
 #
-# An arm is a spec  name:lbd:k:obj:layer:pool  (lbd 0.0 = baseline, --regular). Steps:
+# An arm is a spec  name:lbd:k:obj:layer:pool[:extra]  (lbd 0.0 = baseline, --regular); extra is
+# comma-separated flags for finetune_jepa_obj.py, e.g. vic25:1.0:1:vicreg:-1:last:vic_var=25,vic_cov=1. Steps:
 #   step 0  base:0.0:0:-:-:-   cos:1.0:1:cos:-1:last
 #   step 1  nce0.25:0.25:1:infonce:-1:last   nce1:1.0:1:infonce:-1:last
 #   step 2  ARMS="nce1mean:1.0:1:infonce:-1:mean nce1L8:1.0:1:infonce:8:last"   (after step 1)
@@ -80,7 +81,10 @@ TASK=${SLURM_ARRAY_TASK_ID:-0}
 [ "${TASK}" -lt "${N}" ] || { echo "task ${TASK} >= ${N}" >&2; exit 1; }
 SPEC=${ARMS[$(( TASK % ${#ARMS[@]} ))]}
 SEED=${SEEDS[$(( TASK / ${#ARMS[@]} ))]}
-IFS=: read -r ARM LBD K OBJ LAYER POOL <<< "${SPEC}"
+IFS=: read -r ARM LBD K OBJ LAYER POOL EXTRA <<< "${SPEC}"
+EXTRA_ARGS=()
+IFS=, read -r -a _ex <<< "${EXTRA:-}"
+for e in "${_ex[@]}"; do [ -n "${e}" ] && EXTRA_ARGS+=("--${e}"); done
 
 export MASTER_ADDR=$(hostname -I | awk '{print $1}')
 export MASTER_PORT=$((29900 + TASK))
@@ -95,7 +99,7 @@ nvidia-smi --query-gpu=index,name,memory.used --format=csv
 
 cat > "${RUN_DIR}/config.json" <<EOF
 {"dataset": "${DS}_phaseC_${ARM}", "base_dataset": "${DS}", "arm": "${ARM}", "spec": "${SPEC}",
- "jepa_obj": "${OBJ}", "jepa_layer": "${LAYER}", "jepa_pool": "${POOL}",
+ "jepa_obj": "${OBJ}", "jepa_layer": "${LAYER}", "jepa_pool": "${POOL}", "extra": "${EXTRA:-}",
  "pad_token": "${PAD}", "date_string": "${DATE}", "lr": "${LR}", "lbd": ${LBD}, "k": ${K},
  "seed": ${SEED}, "epochs": ${EPOCHS}, "batch_size": 16, "grad_accum": 1,
  "model": "${MODEL}", "max_new_tokens": ${MAX_NEW_TOKENS}, "stage": "jepa_null_phaseC"}
@@ -112,7 +116,7 @@ if [ ! -f "${CKPT_DIR}/model.safetensors" ]; then
   else
     torchrun --nproc_per_node=4 diagnostics/finetune_jepa_obj.py "${COMMON[@]}" \
       --lbd=${LBD} --predictors=${K} --last_token=-2 --additive_mask \
-      --jepa_obj=${OBJ} --jepa_layer=${LAYER} --jepa_pool=${POOL}
+      --jepa_obj=${OBJ} --jepa_layer=${LAYER} --jepa_pool=${POOL} "${EXTRA_ARGS[@]}"
   fi
 else
   echo "=== ${ARM}/${TAG}: final model present, skipping training ==="
